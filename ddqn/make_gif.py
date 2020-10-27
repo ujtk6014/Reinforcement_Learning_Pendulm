@@ -1,7 +1,6 @@
 # coding: utf-8
 
 from ddqn_pen import *
-
 from PIL import Image,ImageDraw,ImageFont
 import imageio
 from matplotlib import pyplot as plt

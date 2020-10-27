@@ -11,7 +11,7 @@ import torch.nn.functional as F
 STATE_NUM = 2
 
 #######################################################################
-#dualiing networkの実装
+# dualiing networkの実装
 class Net(nn.Module):
     
     def __init__(self, num_states, num_actions):
@@ -366,7 +366,8 @@ if __name__ == '__main__':
             t2 = time.time()
             if test_highscore<total_reward:
                 print("highscore!")
-                torch.save(agent.brain.main_q_net, "model/%06d_hs.model" %episode)
+                model = agent.brain.main_q_net.to('cpu')
+                torch.save(model.state_dict() , "model/%06d_cpu.pth" %episode)
                 # serializers.save_npz('model/%06d_hs.model'%episode, agent.model)
                 test_highscore=total_reward
             # print(episode)
