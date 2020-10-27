@@ -11,21 +11,24 @@ import torch.nn.functional as F
 STATE_NUM = 2
 
 class Net(nn.Module):
-    def __init__(self, n_in = STATE_NUM):
-        super(Net,self).__init__()
-        self.fc1 = nn.Linear(n_in, 16)
-        self.fc2 = nn.Linear(16,64)
-        self.fc3 = nn.Linear(64, 256)
-        self.fc4 = nn.Linear(256, 1024)
-        self.fc5 = nn.Linear(1024, 2)
     
-    def forward(self,x):
-        h1 = F.leaky_relu(self.fc1(x))
-        h2 = F.leaky_relu(self.fc2(h1))
-        h3 = F.leaky_relu(self.fc3(h2))
-        h4 = F.leaky_relu(self.fc4(h3))
-        output = F.leaky_relu(self.fc5(h4))
+    def __init__(self, num_states, num_actions):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(num_states, 16)
+        self.fc2 = nn.Linear(16,64)
+        self.fc3 = nn.Linear(64, 256) #中間層
+        self.fc4 = nn.Linear(256,256)
+        self.fc5 = nn.Linear(256, num_actions)
 
+        #activation
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        h1 = self.relu(self.fc1(x)) # 活性化関数にはReLu
+        h2 = self.relu(self.fc2(h1))
+        h3 = self.relu(self.fc3(h2))
+        h4 = self.relu(self.fc4(h3))
+        output = self.fc5(h4)
         return output
 
 import random 
@@ -34,6 +37,13 @@ from torch import nn
 from torch import optim
 import torch.nn.functional as F
 from collections import namedtuple
+from copy import deepcopy
+
+device2 = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device1 = torch.device("cpu")
+# device = torch.device("cpu")
+print(device1)
+print(device2)
 
 Transition = namedtuple('Transition',('state','action','state_next', 'reward'))
 
@@ -41,8 +51,8 @@ Transition = namedtuple('Transition',('state','action','state_next', 'reward'))
 BACTH_SIZE = 32
 CAPACITY = 10000
 GAMMA = 0.9
-MAX_STEP = 300
-NUM_EPISODES = 500
+MAX_STEP = 400
+NUM_EPISODES = 1000
 
 class ReplayMemory:
     def __init__(self, CAPACITY):
@@ -64,65 +74,20 @@ class ReplayMemory:
     def __len__(self):
         return len(self.memory)
 
-TD_ERROR_EPSILON = 0.0001
-
-class TDerrorMemory:
-    def __init__(self, CAPACITY):
-        self.capacity = CAPACITY
-        self.memory = []
-        self.index = 0
-
-    def push(self, td_error):
-
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-
-        self.memory[self.index] = td_error
-        self.index = (self.index + 1) % self.capacity
-    
-    def __len__(self):
-        return len(self.memory)
-    
-    def get_prioritized_indexes(self, batch_size):
-
-        sum_absolute_td_error = np.sum(np.absolute(self.memory))
-        sum_absolute_td_error += TD_ERROR_EPSILON * len(self.memory)
-
-        rand_list = np.random.uniform(0, sum_absolute_td_error, batch_size)
-        rand_list = np.sort(rand_list)
-
-        indexes = []
-        idx = 0
-
-        tmp_sum_absolute_td_error = 0
-        for rand_num in rand_list:
-            while tmp_sum_absolute_td_error < rand_num:
-                tmp_sum_absolute_td_error += (abs(self.memory[idx]) + TD_ERROR_EPSILON)
-                idx += 1
-
-                if idx >= len(self.memory):
-                    idx = len(self.memory) -1
-                indexes.append(idx)
-        return indexes
-    
-    def update_td_error(self, updated_td_errors):
-        self.memory = updated_td_errors
-                
-
-
 
 class Brain:
-    def __init__(self):
+    def __init__(self, num_states, num_actions):
         self.memory = ReplayMemory(CAPACITY)
-        self.td_error_memory = TDerrorMemory(CAPACITY)
 
-        self.num_actions = 2
+        self.num_actions = num_actions
 
-        self.main_q_net = Net()
-        self.tgt_q_net = Net()
+        self.main_q_net = Net(num_states,num_actions).to(device1)
+        self.tgt_q_net = deepcopy(self.main_q_net).to(device2)
+        self.tgt_q_net.load_state_dict(self.main_q_net.state_dict())
         print(self.main_q_net)
         print(self.tgt_q_net)
         self.optimizer = optim.Adam(self.main_q_net.parameters())
+
     def decide_action(self, state, episode):
         epsilon = 0.5 *( 1/(episode + 1) )
 
@@ -135,54 +100,49 @@ class Brain:
                 action = self.main_q_net(state).max(1)[1].view(1,1)
 
         else:
-            action = torch.LongTensor([[random.randrange(self.num_actions)]])
+            action = torch.tensor([[random.randrange(self.num_actions)]],device=device1,dtype=torch.long)
 
         return action
     
 
-    def replay(self, episode):
+    def replay(self):
         if len(self.memory) < BACTH_SIZE:
             return
         
-        self.batch, self.state_batch, self.action_batch, self.reward_batch, self.next_state_batch = self.make_minibatch(episode)
+        self.batch, self.state_batch, self.action_batch, self.reward_batch, self.non_final_next_state = self.make_minibatch()
 
         self.expected_state_action_values = self.get_expected_state_action_values()
 
         self.update_main_q_network()
 
-    def make_minibatch(self, epidode):
+    def make_minibatch(self):
 
-        if episode < 30:
-            transitions = self.memory.sample(BACTH_SIZE)
-
-        else:
-            indexes = self.td_error_memory.get_prioritized_indexes(BACTH_SIZE)
-            transitions = [self.memory.memory[n] for n in indexes]
-        
+        transitions = self.memory.sample(BACTH_SIZE)
         batch = Transition(*zip(*transitions))
 
         state_batch = torch.cat(batch.state)
         action_batch = torch.cat(batch.action)
         reward_batch = torch.cat(batch.reward)
-        next_state_batch =torch.cat(batch.state_next)
+        non_final_next_state =torch.cat([s for s in batch.state_next if s is not None]).to(device2)
 
-        return batch, state_batch, action_batch, reward_batch, next_state_batch
+        return batch, state_batch, action_batch, reward_batch, non_final_next_state
     
     def get_expected_state_action_values(self):
 
         self.main_q_net.eval()
-        self.tgt_q_net.eval()
-        
         self.state_action_values = self.main_q_net(self.state_batch).gather(1, self.action_batch)
 
-        next_state_values = torch.zeros(BACTH_SIZE)
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, self.batch.state_next)),dtype=torch.uint8)
+        next_state_values = torch.zeros(BACTH_SIZE,device=device2)
         # a_m = torch.zeros(BACTH_SIZE).type(torch.LongTensor)
 
         # a_m = self.main_q_net(self.state_batch).detach().max(1)[1].view(-1,1)
-
-        next_state_values = self.tgt_q_net(self.next_state_batch).max(1)[0].detach()
+        self.tgt_q_net.eval()
+        next_state_values[non_final_mask] = self.tgt_q_net(self.non_final_next_state).max(1)[0].detach()
 
         expected_state_action_values = self.reward_batch + GAMMA * next_state_values
+        # tmp = expected_state_action_values.to(device2)
+        expected_state_action_values = torch.tensor(expected_state_action_values, device=device1).detach()
 
         return expected_state_action_values
     
@@ -201,43 +161,15 @@ class Brain:
 
         self.tgt_q_net.load_state_dict(self.main_q_net.state_dict())
 
-    def update_td_error_memory(self):
-        self.main_q_net.eval()
-        self.tgt_q_net.eval()
-
-        transitions = self.memory.memory
-        batch = Transition(*zip(*transitions))
-
-        state_batch = torch.cat(batch.state)
-        action_batch = torch.cat(batch.action)
-        reward_batch = torch.cat(batch.reward)
-        next_state_batch =torch.cat(batch.state_next)
-
-        state_action_values = self.main_q_net(state_batch).gather(1, action_batch)
-
-        next_state_values = torch.zeros(len(self.memory))
-        # a_m = torch.zeros(BACTH_SIZE).type(torch.LongTensor)
-
-        # a_m = self.main_q_net(self.state_batch).detach().max(1)[1].view(-1,1)
-
-        next_state_values = self.tgt_q_net(self.next_state_batch).max(1)[0].detach().squeeze()
-        # print(state_action_values.size())
-        # print(next_state_values.size())
-        # print(reward_batch.size())
-        td_errors = (reward_batch + GAMMA * next_state_values) - state_action_values.squeeze()
-
-        self.td_error_memory.memory = td_errors.detach().numpy().tolist()
-
-
 class Agent:
-    def __init__(self):
-        self.brain = Brain()
+    def __init__(self,num_states,num_actions):
+        self.brain = Brain(num_states, num_actions)
 
-    def update_q_functions(self, episode):
-        self.brain.replay(episode)
+    def update_q_functions(self):
+        self.brain.replay()
 
     def get_action(self, state, episode):
-        action = self.brain.decide_action(state, episode)
+        action = self.brain.decide_action(state,episode)
 
         return action
     
@@ -247,11 +179,6 @@ class Agent:
     def update_tgt_q_functions(self):
         self.brain.update_tgt_q_network()
 
-    def memorize_td_error(self, td_error):
-        self.brain.td_error_memory.push(td_error)
-
-    def update_td_error_memory(self):
-        self.brain.update_td_error_memory()
 
 class pendulumEnvironment:
 
@@ -273,7 +200,7 @@ class pendulumEnvironment:
 
         else:
             reward = -np.abs(h)
-        
+        # print(reward)
         return reward
     
     def get_state(self):
@@ -286,7 +213,6 @@ class pendulumEnvironment:
         self.th_ += -self.g*np.sin(self.th)+power
         self.th_old = self.th
         self.th += self.th_
-        # print(self.th, self.th_)
 
     def ani(self):
         """
@@ -294,9 +220,12 @@ class pendulumEnvironment:
         """
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
-        fig = plt.figure()
-        anim = animation.FuncAnimation
-
+        fig = plt.figure(figsize=(6, 6))
+        th = self.th.numpy().tolist()
+        c = (3,3)
+        x = c[0]+1.5*np.sin(th[0])
+        y = c[1]+1.5*np.cos(th[0])
+        plt.plot([c[0],x],[c[1],y])
         plt.show()
         # dr=sw.Drawing("hoge.svg",(150,150))
         # c=(75,75)
@@ -312,47 +241,104 @@ class simulator:
 
     def run(self, episode, train=True, movie=False):
         self.env.reset(0,0)
-        state = env.get_state()
-        state = torch.FloatTensor(state)
+        state = self.env.get_state()
+        state = torch.tensor(state,device=device1,dtype=torch.float)
         self.episode = episode
         total_reward = 0
+        self.actions=[-1,1] 
 
         for _ in range(MAX_STEP):
 
-            action = self.agent.get_action(state, self.episode)
-
-            self.env.update_state(action)
+            action = self.agent.get_action(state,self.episode)
+            actions = self.actions[action] 
+            self.env.update_state(actions)
             reward = self.env.get_reward()
-            reward += reward
-            reward = torch.FloatTensor([reward])
+            total_reward += reward
+            reward = torch.tensor([reward],device=device2,dtype=torch.float)
 
 
-            state_next = env.get_state()
-            state_next = torch.FloatTensor(state_next)
+            state_next = self.env.get_state()
+            state_next = torch.FloatTensor(state_next).to(device1)
+            # state_next = torch.tensor(state_next,device=device1,dtype=torch.float)
 
 
             self.agent.memorize(state, action, state_next, reward)
 
-            self.agent.memorize_td_error(0)
-
             if train:
-                self.agent.update_q_functions(self.episode)
+                self.agent.update_q_functions()
 
             # if movie:
             #     self.env.ani()
             #     time.sleep(0.01)
 
             state = state_next
-            
-        self.agent.update_td_error_memory()
 
-        if train and self.episode % 2 == 0:
+        if train and self.episode % 10 == 0:
             self.agent.update_tgt_q_functions()
 
         return total_reward
-        
+
+    def run_gif(self, episode, train=True, movie=False):
+        self.env.reset(0,0)
+        state = self.env.get_state()
+        state = torch.tensor(state,dtype=torch.float)
+        self.episode = episode
+        total_reward = 0
+        self.log=[]
+        self.actions=[-1,1] 
+
+        for _ in range(MAX_STEP):
+
+            action = self.agent.get_action(state,self.episode)
+            actions = self.actions[action] 
+            self.env.update_state(actions)
+            reward = self.env.get_reward()
+            total_reward += reward
+            reward = torch.tensor([reward],dtype=torch.float)
+
+
+            state_next = self.env.get_state()
+            state_next = torch.tensor(state_next,dtype=torch.float)
+
+
+            self.agent.memorize(state, action, state_next, reward)
+            s = state[0].numpy()
+            a = action[0].numpy()
+            r = reward.numpy()
+            print(state,action,reward)
+            print(s,a,r)
+            self.log.append(np.hstack([s[0], a, r]))
+
+            if train:
+                self.agent.update_q_functions()
+
+            # if movie:
+            #     self.env.ani()
+            #     time.sleep(0.01)
+
+            state = state_next
+
+        if train and self.episode % 10 == 0:
+            self.agent.update_tgt_q_functions()
+
+        return total_reward,self.log
+
+# import matplotlib.pyplot as plt
+# import matplotlib.animation as animation
+# fig = plt.figure(figsize=(6, 6))
+# th = self.th.numpy().tolist()
+# c = (3,3)
+# x = c[0]+1.5*np.sin(th[0])
+# y = c[1]+1.5*np.cos(th[0])
+# plt.plot([c[0],x],[c[1],y])
+# plt.show()
+
+import time
 if __name__ == '__main__':
-    agent = Agent()
+    num_states = 2
+    num_actions = 2
+    t1 = time.time()
+    agent = Agent(num_states, num_actions)
     env = pendulumEnvironment()
     sim = simulator(env,agent)
 
@@ -362,18 +348,21 @@ if __name__ == '__main__':
 
     for episode in range(NUM_EPISODES):
         total_reward=sim.run(episode, train=True,movie=True)
-
         # if episode%1000 ==0:
             # serializers.save_npz('model/%06d.model'%episode, agent.model)
 
         if episode%10 == 0:
             total_reward=sim.run(episode, train=False, movie=False)
+            t2 = time.time()
             if test_highscore<total_reward:
                 print("highscore!")
+                torch.save(agent.brain.main_q_net, "model/%06d_hs.model" %episode)
                 # serializers.save_npz('model/%06d_hs.model'%episode, agent.model)
                 test_highscore=total_reward
-            print(episode)
-            print(total_reward)
+            # print(episode)
+            # print(total_reward)
+            print('Finished %d Episode: Total reward = %.2f: Elasped time = %.2f' %(episode, total_reward, t2-t1))
+            t1 = time.time()
 
             out=("%d,%d\n" % (episode,total_reward))
             fw.write(out)

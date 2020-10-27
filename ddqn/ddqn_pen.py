@@ -10,6 +10,8 @@ import torch.nn.functional as F
 
 STATE_NUM = 2
 
+#######################################################################
+#dualiing networkの実装
 class Net(nn.Module):
     
     def __init__(self, num_states, num_actions):
@@ -18,15 +20,24 @@ class Net(nn.Module):
         self.fc2 = nn.Linear(16,64)
         self.fc3 = nn.Linear(64, 256) #中間層
         self.fc4 = nn.Linear(256,256)
-        self.fc5 = nn.Linear(256, num_actions)
+        self.fc5_adv = nn.Linear(256, num_actions)
+        self.fc5_v = nn.Linear(256, 1)
+
+        #activation
+        self.relu = nn.ReLU()
     
     def forward(self, x):
-        h1 = F.relu(self.fc1(x)) # 活性化関数にはReLu
-        h2 = F.relu(self.fc2(h1))
-        h3 = F.relu(self.fc3(h2))
-        h4 = F.relu(self.fc4(h3))
-        output = self.fc5(h4)
+        h1 = self.relu(self.fc1(x)) # 活性化関数にはReLu
+        h2 = self.relu(self.fc2(h1))
+        h3 = self.relu(self.fc3(h2))
+        h4 = self.relu(self.fc4(h3))
+        adv = self.fc5_adv(h4)
+        val = self.fc5_v(h4).expand(-1,adv.size(1))
+
+        output = val + adv - adv.mean(1,keepdim=True).expand(-1,adv.size(1))
+
         return output
+#########################################################################
 
 import random 
 import torch 
@@ -36,8 +47,8 @@ import torch.nn.functional as F
 from collections import namedtuple
 from copy import deepcopy
 
-device2 = torch.device("cpu") #("cuda" if torch.cuda.is_available() else "cpu")
-device1 = torch.device("cpu")
+device1 = torch.device("cpu")#("cuda" if torch.cuda.is_available() else "cpu")
+device2 = torch.device("cpu")
 # device = torch.device("cpu")
 print(device1)
 print(device2)
@@ -131,11 +142,13 @@ class Brain:
 
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, self.batch.state_next)),dtype=torch.uint8)
         next_state_values = torch.zeros(BACTH_SIZE,device=device2)
-        # a_m = torch.zeros(BACTH_SIZE).type(torch.LongTensor)
+        a_m = torch.zeros(BACTH_SIZE, device=device1, dtype=torch.long)
+        tmp = self.non_final_next_state.to(device1)
+        a_m[non_final_mask] = self.main_q_net(tmp).detach().max(1)[1]
+        a_m_non_final_next_state = a_m[non_final_mask].view(-1,1).to(device2)
 
-        # a_m = self.main_q_net(self.state_batch).detach().max(1)[1].view(-1,1)
         self.tgt_q_net.eval()
-        next_state_values[non_final_mask] = self.tgt_q_net(self.non_final_next_state).max(1)[0].detach()
+        next_state_values[non_final_mask] = self.tgt_q_net(self.non_final_next_state).gather(1,a_m_non_final_next_state).detach().squeeze()
 
         expected_state_action_values = self.reward_batch + GAMMA * next_state_values
         # tmp = expected_state_action_values.to(device2)
@@ -238,7 +251,7 @@ class simulator:
 
     def run(self, episode, train=True, movie=False):
         self.env.reset(0,0)
-        state = env.get_state()
+        state = self.env.get_state()
         state = torch.tensor(state,device=device1,dtype=torch.float)
         self.episode = episode
         total_reward = 0
@@ -254,8 +267,9 @@ class simulator:
             reward = torch.tensor([reward],device=device2,dtype=torch.float)
 
 
-            state_next = env.get_state()
-            state_next = torch.tensor(state_next,device=device1,dtype=torch.float)
+            state_next = self.env.get_state()
+            state_next = torch.FloatTensor(state_next).to(device1)
+            # state_next = torch.tensor(state_next,device=device1,dtype=torch.float)
 
 
             self.agent.memorize(state, action, state_next, reward)
@@ -274,15 +288,60 @@ class simulator:
 
         return total_reward
 
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-fig = plt.figure(figsize=(6, 6))
-th = self.th.numpy().tolist()
-c = (3,3)
-x = c[0]+1.5*np.sin(th[0])
-y = c[1]+1.5*np.cos(th[0])
-plt.plot([c[0],x],[c[1],y])
-plt.show()
+    def run_gif(self, episode, train=True, movie=False):
+        self.env.reset(0,0)
+        state = self.env.get_state()
+        state = torch.tensor(state,dtype=torch.float)
+        self.episode = episode
+        total_reward = 0
+        self.log=[]
+        self.actions=[-1,1] 
+
+        for _ in range(MAX_STEP):
+
+            action = self.agent.get_action(state,self.episode)
+            actions = self.actions[action] 
+            self.env.update_state(actions)
+            reward = self.env.get_reward()
+            total_reward += reward
+            reward = torch.tensor([reward],dtype=torch.float)
+
+
+            state_next = self.env.get_state()
+            state_next = torch.tensor(state_next,dtype=torch.float)
+
+
+            self.agent.memorize(state, action, state_next, reward)
+            s = state[0].numpy()
+            a = action[0].numpy()
+            r = reward.numpy()
+            print(state,action,reward)
+            print(s,a,r)
+            self.log.append(np.hstack([s[0], a, r]))
+
+            if train:
+                self.agent.update_q_functions()
+
+            # if movie:
+            #     self.env.ani()
+            #     time.sleep(0.01)
+
+            state = state_next
+
+        if train and self.episode % 10 == 0:
+            self.agent.update_tgt_q_functions()
+
+        return total_reward,self.log
+
+# import matplotlib.pyplot as plt
+# import matplotlib.animation as animation
+# fig = plt.figure(figsize=(6, 6))
+# th = self.th.numpy().tolist()
+# c = (3,3)
+# x = c[0]+1.5*np.sin(th[0])
+# y = c[1]+1.5*np.cos(th[0])
+# plt.plot([c[0],x],[c[1],y])
+# plt.show()
 
 import time
 if __name__ == '__main__':
@@ -307,11 +366,12 @@ if __name__ == '__main__':
             t2 = time.time()
             if test_highscore<total_reward:
                 print("highscore!")
+                torch.save(agent.brain.main_q_net, "model/%06d_hs.model" %episode)
                 # serializers.save_npz('model/%06d_hs.model'%episode, agent.model)
                 test_highscore=total_reward
             # print(episode)
             # print(total_reward)
-            print('%d Episode: Total reward = %.2f: Elasped time = %.2f' %(episode, total_reward, t2-t1))
+            print('Finished %d Episode: Total reward = %.2f: Elasped time = %.2f' %(episode, total_reward, t2-t1))
             t1 = time.time()
 
             out=("%d,%d\n" % (episode,total_reward))
